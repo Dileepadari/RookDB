@@ -232,6 +232,200 @@ pub fn run_join_cmd(
     Ok(())
 }
 
+/// Benchmark join command (Option 10).
+pub fn run_benchmark_cmd(
+    _catalog: &Catalog,
+    current_db: &Option<String>,
+) -> io::Result<()> {
+    // Guard: database must be selected
+    let db = match current_db {
+        Some(d) => d,
+        None => {
+            println!("No database selected. Use option 3 first.");
+            return Ok(());
+        }
+    };
+
+    let catalog = load_catalog();
+
+    let database = match catalog.databases.get(db.as_str()) {
+        Some(d) => d,
+        None => {
+            println!("Database '{}' not found in catalog.", db);
+            return Ok(());
+        }
+    };
+
+    // Collect the same inputs as run_join_cmd
+    print!("Enter left table name: ");
+    io::stdout().flush()?;
+    let mut left_table = String::new();
+    io::stdin().read_line(&mut left_table)?;
+    let left_table = left_table.trim().to_string();
+
+    if !database.tables.contains_key(&left_table) {
+        println!("Table '{}' not found in database '{}'.", left_table, db);
+        return Ok(());
+    }
+
+    print!("Enter right table name: ");
+    io::stdout().flush()?;
+    let mut right_table = String::new();
+    io::stdin().read_line(&mut right_table)?;
+    let right_table = right_table.trim().to_string();
+
+    if !database.tables.contains_key(&right_table) {
+        println!("Table '{}' not found in database '{}'.", right_table, db);
+        return Ok(());
+    }
+
+    let left_cols = &database.tables.get(&left_table).unwrap().columns;
+    println!("\nColumns in '{}': {}", left_table,
+        left_cols.iter().map(|c| format!("{} ({})", c.name, c.data_type)).collect::<Vec<_>>().join(", "));
+
+    print!("Enter join column from '{}': ", left_table);
+    io::stdout().flush()?;
+    let mut left_col = String::new();
+    io::stdin().read_line(&mut left_col)?;
+    let left_col = left_col.trim().to_string();
+
+    if !left_cols.iter().any(|c| c.name == left_col) {
+        println!("Column '{}' not found in table '{}'.", left_col, left_table);
+        return Ok(());
+    }
+
+    println!("\nSelect join operator:");
+    println!("  1. =  (Equal)");
+    println!("  2. != (Not Equal)");
+    println!("  3. <  (Less Than)");
+    println!("  4. >  (Greater Than)");
+    println!("  5. <= (Less Than or Equal)");
+    println!("  6. >= (Greater Than or Equal)");
+    print!("Enter operator choice (1-6): ");
+    io::stdout().flush()?;
+    let mut op_choice = String::new();
+    io::stdin().read_line(&mut op_choice)?;
+    let op = match op_choice.trim() {
+        "1" => JoinOp::Eq,
+        "2" => JoinOp::Ne,
+        "3" => JoinOp::Lt,
+        "4" => JoinOp::Gt,
+        "5" => JoinOp::Le,
+        "6" => JoinOp::Ge,
+        _ => JoinOp::Eq,
+    };
+
+    let right_cols = &database.tables.get(&right_table).unwrap().columns;
+    println!("\nColumns in '{}': {}", right_table,
+        right_cols.iter().map(|c| format!("{} ({})", c.name, c.data_type)).collect::<Vec<_>>().join(", "));
+
+    print!("Enter join column from '{}': ", right_table);
+    io::stdout().flush()?;
+    let mut right_col = String::new();
+    io::stdin().read_line(&mut right_col)?;
+    let right_col = right_col.trim().to_string();
+
+    if !right_cols.iter().any(|c| c.name == right_col) {
+        println!("Column '{}' not found in table '{}'.", right_col, right_table);
+        return Ok(());
+    }
+
+    println!("\nSelect join type:");
+    println!("  1. Inner Join (default)");
+    println!("  2. Left Outer Join");
+    println!("  3. Right Outer Join");
+    println!("  4. Full Outer Join");
+    println!("  5. Cross Join");
+    print!("Enter join type (1-5): ");
+    io::stdout().flush()?;
+    let mut jt_choice = String::new();
+    io::stdin().read_line(&mut jt_choice)?;
+    let join_type = match jt_choice.trim() {
+        "1" => JoinType::Inner,
+        "2" => JoinType::LeftOuter,
+        "3" => JoinType::RightOuter,
+        "4" => JoinType::FullOuter,
+        "5" => JoinType::Cross,
+        _ => JoinType::Inner,
+    };
+
+    let condition = JoinCondition {
+        left_table: left_table.clone(),
+        left_col: left_col.clone(),
+        operator: op,
+        right_table: right_table.clone(),
+        right_col: right_col.clone(),
+    };
+
+    println!("\n========== Running all three algorithms for benchmarking ==========\n");
+
+    // NLJ
+    let mut nlj_metrics = JoinMetrics::start("Nested Loop Join (NLJ)");
+    let nlj_result = {
+        let executor = NLJExecutor {
+            outer_table: left_table.clone(),
+            inner_table: right_table.clone(),
+            conditions: vec![condition.clone()],
+            join_type,
+            block_size: 2,
+            mode: NLJMode::Simple,
+        };
+        executor.execute(db, &catalog)?
+    };
+    nlj_metrics.tuples_output = nlj_result.tuples.len() as u64;
+    nlj_metrics.stop();
+
+    // SMJ
+    let mut smj_metrics = JoinMetrics::start("Sort-Merge Join (SMJ)");
+    let smj_result = {
+        let executor = SMJExecutor {
+            left_table: left_table.clone(),
+            right_table: right_table.clone(),
+            conditions: vec![condition.clone()],
+            join_type,
+            memory_pages: 10,
+        };
+        executor.execute(db, &catalog)?
+    };
+    smj_metrics.tuples_output = smj_result.tuples.len() as u64;
+    smj_metrics.stop();
+
+    // HJ
+    let mut hj_metrics = JoinMetrics::start("Hash Join (HJ)");
+    let hj_result = {
+        let executor = HashJoinExecutor {
+            build_table: right_table.clone(),
+            probe_table: left_table.clone(),
+            conditions: vec![condition.clone()],
+            join_type,
+            memory_pages: 10,
+            num_partitions: 4,
+        };
+        executor.execute(db, &catalog)?
+    };
+    hj_metrics.tuples_output = hj_result.tuples.len() as u64;
+    hj_metrics.stop();
+
+    // Print comparison table
+    println!("\n{:<25} {:>12} {:>14}", "Algorithm", "Time (ms)", "Tuples Output");
+    println!("{}", "-".repeat(55));
+    nlj_metrics.display_row();
+    smj_metrics.display_row();
+    hj_metrics.display_row();
+
+    // Verify correctness parity
+    if nlj_result.tuples.len() == smj_result.tuples.len() && nlj_result.tuples.len() == hj_result.tuples.len() {
+        println!("\n✓ All three algorithms produced the same number of result tuples ({}).", nlj_result.tuples.len());
+    } else {
+        println!("\n⚠ Result counts differ: NLJ={}, SMJ={}, HJ={}",
+            nlj_result.tuples.len(), smj_result.tuples.len(), hj_result.tuples.len());
+    }
+
+    println!("\n=================================================================\n");
+
+    Ok(())
+}
+
 /// Rule-based algorithm auto-selector.
 fn auto_select_algorithm(
     condition: &JoinCondition,
