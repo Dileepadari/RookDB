@@ -18,7 +18,7 @@ use super::tuple::{ColumnValue, Tuple};
 
 /// In-memory hash table for build phase.
 pub struct HashTable {
-    pub buckets: HashMap<u64, Vec<Tuple>>,
+    pub buckets: HashMap<u64, Vec<(Tuple, bool)>>, // tuple and its matched status
 }
 
 /// Hash Join executor.
@@ -33,7 +33,6 @@ pub struct HashJoinExecutor {
 
 impl HashJoinExecutor {
     pub fn execute(&self, db: &str, catalog: &Catalog) -> io::Result<JoinResult> {
-        // Determine if build table fits in memory
         let build_path = format!("database/base/{}/{}.dat", db, self.build_table);
         let mut build_file = OpenOptions::new().read(true).write(true).open(&build_path)?;
         let build_pages = page_count(&mut build_file)?;
@@ -52,43 +51,33 @@ impl HashJoinExecutor {
         let build_schema = build_scanner.schema.clone();
         let probe_schema = probe_scanner.schema.clone();
 
-        // Determine which column to hash on
         let build_col = self.conditions.first()
             .map(|c| {
-                // The build table might be left or right in the condition
-                if c.left_table == self.build_table {
-                    c.left_col.clone()
-                } else {
-                    c.right_col.clone()
-                }
+                if c.left_table == self.build_table { c.left_col.clone() } else { c.right_col.clone() }
             })
             .unwrap_or_default();
 
         let probe_col = self.conditions.first()
             .map(|c| {
-                if c.left_table == self.probe_table {
-                    c.left_col.clone()
-                } else {
-                    c.right_col.clone()
-                }
+                if c.left_table == self.probe_table { c.left_col.clone() } else { c.right_col.clone() }
             })
             .unwrap_or_default();
 
         // Build phase
-        let ht = self.build_phase(&mut build_scanner, &build_col);
+        let mut ht = self.build_phase(&mut build_scanner, &build_col);
 
         // Probe phase
-        let result = self.probe_phase(&ht, &mut probe_scanner, &probe_col, &build_schema, &probe_schema);
+        let result = self.probe_phase(&mut ht, &mut probe_scanner, &probe_col, &build_schema, &probe_schema);
 
         Ok(result)
     }
 
     fn build_phase(&self, scanner: &mut TupleScanner, hash_col: &str) -> HashTable {
-        let mut buckets: HashMap<u64, Vec<Tuple>> = HashMap::new();
+        let mut buckets: HashMap<u64, Vec<(Tuple, bool)>> = HashMap::new();
 
         while let Some(t) = scanner.next_tuple() {
             let key = self.hash_value(t.get_field(hash_col));
-            buckets.entry(key).or_insert_with(Vec::new).push(t);
+            buckets.entry(key).or_insert_with(Vec::new).push((t, false));
         }
 
         HashTable { buckets }
@@ -96,14 +85,12 @@ impl HashJoinExecutor {
 
     fn probe_phase(
         &self,
-        ht: &HashTable,
+        ht: &mut HashTable,
         scanner: &mut TupleScanner,
         hash_col: &str,
         build_schema: &[Column],
         probe_schema: &[Column],
     ) -> JoinResult {
-        // Determine output order: build is "left" in condition, probe is "right"
-        // But we need to match the output schema to left_table/right_table from conditions
         let (left_table, right_table, left_schema, right_schema, build_is_left) = {
             if let Some(c) = self.conditions.first() {
                 if c.left_table == self.build_table {
@@ -120,13 +107,46 @@ impl HashJoinExecutor {
 
         while let Some(p) = scanner.next_tuple() {
             let key = self.hash_value(p.get_field(hash_col));
+            let mut matched = false;
 
-            if let Some(build_tuples) = ht.buckets.get(&key) {
-                for b in build_tuples {
-                    // Evaluate conditions with proper left/right orientation
-                    let (left, right) = if build_is_left { (b, &p) } else { (&p, b) };
+            if let Some(build_list) = ht.buckets.get_mut(&key) {
+                for (b, b_matched) in build_list.iter_mut() {
+                    let (left, right) = if build_is_left { (&*b, &p) } else { (&p, &*b) };
                     if evaluate_conditions(&self.conditions, left, right) {
                         result.add(Tuple::merge(left, right));
+                        matched = true;
+                        *b_matched = true;
+                    }
+                }
+            }
+
+            let probe_is_left = !build_is_left;
+            if self.join_type == JoinType::LeftOuter && probe_is_left && !matched {
+                let null_build = Tuple::null_tuple(build_schema);
+                result.add(Tuple::merge(&p, &null_build));
+            } else if self.join_type == JoinType::RightOuter && !probe_is_left && !matched {
+                let null_build = Tuple::null_tuple(build_schema);
+                result.add(Tuple::merge(&null_build, &p));
+            } else if self.join_type == JoinType::FullOuter && !matched {
+                let null_build = Tuple::null_tuple(build_schema);
+                let (l, r) = if probe_is_left { (&p, &null_build) } else { (&null_build, &p) };
+                result.add(Tuple::merge(l, r));
+            }
+        }
+
+        if (self.join_type == JoinType::LeftOuter && build_is_left) ||
+           (self.join_type == JoinType::RightOuter && !build_is_left) ||
+           self.join_type == JoinType::FullOuter {
+            
+            for build_list in ht.buckets.values() {
+                for (b, b_matched) in build_list {
+                    if !b_matched {
+                        let (l, r) = if build_is_left {
+                             (b, &Tuple::null_tuple(probe_schema))
+                        } else {
+                             (&Tuple::null_tuple(probe_schema), b)
+                        };
+                        result.add(Tuple::merge(l, r));
                     }
                 }
             }
@@ -172,14 +192,11 @@ impl HashJoinExecutor {
 
         let num_parts = self.num_partitions.max(2);
 
-        // Partition build table
         self.partition_table(db, catalog, &self.build_table, &build_col, &build_schema, "build", num_parts)?;
-        // Partition probe table
         self.partition_table(db, catalog, &self.probe_table, &probe_col, &probe_schema, "probe", num_parts)?;
 
         let mut result = JoinResult::new(&left_schema, &right_schema, &left_table, &right_table);
 
-        // For each partition pair, do simple hash join
         for i in 0..num_parts {
             let build_part_path = format!("database/tmp/hash_part_build_{}.tmp", i);
             let probe_part_path = format!("database/tmp/hash_part_probe_{}.tmp", i);
@@ -194,24 +211,54 @@ impl HashJoinExecutor {
             let mut build_scanner = TupleScanner::from_file(build_file, build_schema.clone())?;
             let mut probe_scanner = TupleScanner::from_file(probe_file, probe_schema.clone())?;
 
-            // Build in-memory hash table from build partition
-            let ht = self.build_phase(&mut build_scanner, &build_col);
+            let mut ht = self.build_phase(&mut build_scanner, &build_col);
 
-            // Probe
             while let Some(p) = probe_scanner.next_tuple() {
                 let key = self.hash_value(p.get_field(&probe_col));
-                if let Some(build_tuples) = ht.buckets.get(&key) {
-                    for b in build_tuples {
-                        let (left, right) = if build_is_left { (b, &p) } else { (&p, b) };
+                let mut matched = false;
+                if let Some(build_list) = ht.buckets.get_mut(&key) {
+                    for (b, b_matched) in build_list.iter_mut() {
+                        let (left, right) = if build_is_left { (&*b, &p) } else { (&p, &*b) };
                         if evaluate_conditions(&self.conditions, left, right) {
                             result.add(Tuple::merge(left, right));
+                            matched = true;
+                            *b_matched = true;
+                        }
+                    }
+                }
+                
+                let probe_is_left = !build_is_left;
+                if self.join_type == JoinType::LeftOuter && probe_is_left && !matched {
+                    let null_build = Tuple::null_tuple(&build_schema);
+                    result.add(Tuple::merge(&p, &null_build));
+                } else if self.join_type == JoinType::RightOuter && !probe_is_left && !matched {
+                    let null_build = Tuple::null_tuple(&build_schema);
+                    result.add(Tuple::merge(&null_build, &p));
+                } else if self.join_type == JoinType::FullOuter && !matched {
+                    let null_build = Tuple::null_tuple(&build_schema);
+                    let (l, r) = if probe_is_left { (&p, &null_build) } else { (&null_build, &p) };
+                    result.add(Tuple::merge(l, r));
+                }
+            }
+
+            if (self.join_type == JoinType::LeftOuter && build_is_left) ||
+               (self.join_type == JoinType::RightOuter && !build_is_left) ||
+               self.join_type == JoinType::FullOuter {
+                for build_list in ht.buckets.values() {
+                    for (b, b_matched) in build_list {
+                        if !b_matched {
+                            let (l, r) = if build_is_left {
+                                 (b, &Tuple::null_tuple(&probe_schema))
+                            } else {
+                                 (&Tuple::null_tuple(&probe_schema), b)
+                            };
+                            result.add(Tuple::merge(l, r));
                         }
                     }
                 }
             }
         }
 
-        // Cleanup
         self.cleanup_temp_files()?;
 
         Ok(result)
@@ -229,7 +276,6 @@ impl HashJoinExecutor {
     ) -> io::Result<()> {
         let mut scanner = TupleScanner::new(db, table, catalog)?;
 
-        // Create partition files
         let mut part_files: Vec<File> = Vec::new();
         for i in 0..num_parts {
             let path = format!("database/tmp/hash_part_{}_{}.tmp", label, i);
@@ -237,7 +283,6 @@ impl HashJoinExecutor {
                 .create(true).write(true).read(true).truncate(true)
                 .open(&path)?;
 
-            // Write header
             let mut header = vec![0u8; PAGE_SIZE];
             header[0..4].copy_from_slice(&1u32.to_le_bytes());
             f.write_all(&header)?;
@@ -246,7 +291,6 @@ impl HashJoinExecutor {
             part_files.push(f);
         }
 
-        // Distribute tuples
         while let Some(t) = scanner.next_tuple() {
             let key = self.hash_value(t.get_field(hash_col));
             let part_idx = (key as usize) % num_parts;
@@ -261,7 +305,6 @@ impl HashJoinExecutor {
         match val {
             Some(ColumnValue::Int(v)) => *v as u64,
             Some(ColumnValue::Text(s)) => {
-                // Simple hash for text
                 let mut hash: u64 = 5381;
                 for b in s.trim().bytes() {
                     hash = hash.wrapping_mul(33).wrapping_add(b as u64);
@@ -306,7 +349,9 @@ impl HashJoinExecutor {
         if let Ok(entries) = fs::read_dir(tmp_dir) {
             for entry in entries {
                 if let Ok(entry) = entry {
-                    let _ = fs::remove_file(entry.path());
+                    if entry.path().is_file() {
+                        let _ = fs::remove_file(entry.path());
+                    }
                 }
             }
         }

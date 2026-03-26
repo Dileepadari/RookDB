@@ -1,7 +1,9 @@
 //! Sort-Merge Join executor with external sort and merge-join.
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::fs::{self, OpenOptions};
-use std::io::{self};
+use std::io::{self, Write};
 
 use crate::catalog::types::{Catalog, Column};
 use crate::disk::create_page;
@@ -30,12 +32,40 @@ pub struct SMJExecutor {
     pub memory_pages: usize,
 }
 
+struct MergeItem {
+    tuple: Tuple,
+    run_idx: usize,
+    sort_col_idx: usize,
+}
+
+impl PartialEq for MergeItem {
+    fn eq(&self, other: &Self) -> bool {
+        let val_a = &self.tuple.values[self.sort_col_idx];
+        let val_b = &other.tuple.values[self.sort_col_idx];
+        val_a.eq_value(val_b)
+    }
+}
+impl Eq for MergeItem {}
+
+impl PartialOrd for MergeItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        let val_a = &self.tuple.values[self.sort_col_idx];
+        let val_b = &other.tuple.values[self.sort_col_idx];
+        // We want a min-heap, so we reverse the ordering
+        val_b.partial_cmp_values(val_a)
+    }
+}
+impl Ord for MergeItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+    }
+}
+
 impl SMJExecutor {
     pub fn execute(&self, db: &str, catalog: &Catalog) -> io::Result<JoinResult> {
         // Ensure tmp directory exists
         fs::create_dir_all("database/tmp")?;
 
-        // Get schemas
         let left_database = catalog.databases.get(db).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "Database not found")
         })?;
@@ -46,7 +76,6 @@ impl SMJExecutor {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Right table not found"))?
             .columns.clone();
 
-        // Get the sort key column names from the first condition
         let left_sort_col = self.conditions.first()
             .map(|c| c.left_col.clone())
             .unwrap_or_default();
@@ -54,18 +83,14 @@ impl SMJExecutor {
             .map(|c| c.right_col.clone())
             .unwrap_or_default();
 
-        // Sort both relations
         let left_runs = self.sort_relation(&self.left_table, db, catalog, &left_sort_col)?;
         let right_runs = self.sort_relation(&self.right_table, db, catalog, &right_sort_col)?;
 
-        // Merge runs for each side
-        let left_merged = self.merge_all_runs(left_runs, &left_schema)?;
-        let right_merged = self.merge_all_runs(right_runs, &right_schema)?;
+        let left_merged = self.merge_all_runs(left_runs, &left_schema, &left_sort_col)?;
+        let right_merged = self.merge_all_runs(right_runs, &right_schema, &right_sort_col)?;
 
-        // Perform merge join
-        let result = self.merge_join(&left_merged, &right_merged, &left_schema, &right_schema, &left_sort_col, &right_sort_col)?;
+        let result = self.merge_join(db, catalog, &left_merged, &right_merged, &left_schema, &right_schema, &left_sort_col, &right_sort_col)?;
 
-        // Cleanup temp files
         let _ = self.cleanup_temp_files();
 
         Ok(result)
@@ -78,9 +103,8 @@ impl SMJExecutor {
         let mut run_id = 0u32;
 
         loop {
-            // Read a batch of tuples (simulating memory_pages worth)
             let mut batch: Vec<Tuple> = Vec::new();
-            let batch_limit = self.memory_pages * 100; // approximate tuples per memory buffer
+            let batch_limit = self.memory_pages * 100;
 
             for _ in 0..batch_limit {
                 match scanner.next_tuple() {
@@ -93,38 +117,29 @@ impl SMJExecutor {
                 break;
             }
 
-            // Sort batch by sort column
             batch.sort_by(|a, b| {
                 let va = a.get_field(sort_col);
                 let vb = b.get_field(sort_col);
                 match (va, vb) {
                     (Some(va), Some(vb)) => {
-                        va.partial_cmp_values(vb).unwrap_or(std::cmp::Ordering::Equal)
+                        va.partial_cmp_values(vb).unwrap_or(Ordering::Equal)
                     }
-                    _ => std::cmp::Ordering::Equal,
+                    _ => Ordering::Equal,
                 }
             });
 
-            // Write sorted batch to temp file
             let run_path = format!("database/tmp/sort_run_{}_{}.tmp", table, run_id);
             let mut run_file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .read(true)
-                .truncate(true)
+                .create(true).write(true).read(true).truncate(true)
                 .open(&run_path)?;
 
-            // Write header
             let mut header = vec![0u8; PAGE_SIZE];
             header[0..4].copy_from_slice(&1u32.to_le_bytes());
             run_file.write_all(&header)?;
-            use std::io::Write;
             run_file.flush()?;
 
-            // Create first data page
             create_page(&mut run_file)?;
 
-            // Insert sorted tuples
             for t in &batch {
                 let bytes = self.serialize_tuple(t, &schema);
                 insert_tuple(&mut run_file, &bytes)?;
@@ -141,16 +156,14 @@ impl SMJExecutor {
         Ok(runs)
     }
 
-    fn merge_all_runs(&self, runs: Vec<SortRun>, schema: &[Column]) -> io::Result<SortRun> {
+    fn merge_all_runs(&self, mut runs: Vec<SortRun>, schema: &[Column], sort_col: &str) -> io::Result<SortRun> {
         if runs.is_empty() {
-            // Create an empty run
-            let path = "database/tmp/empty_run.tmp".to_string();
+            let path = format!("database/tmp/empty_run_{}.tmp", uuid_simple());
             let mut file = OpenOptions::new()
                 .create(true).write(true).read(true).truncate(true)
                 .open(&path)?;
             let mut header = vec![0u8; PAGE_SIZE];
             header[0..4].copy_from_slice(&1u32.to_le_bytes());
-            use std::io::Write;
             file.write_all(&header)?;
             file.flush()?;
             create_page(&mut file)?;
@@ -158,56 +171,70 @@ impl SMJExecutor {
             return Ok(SortRun { file_path: path, page_count: pc });
         }
 
-        if runs.len() == 1 {
-            return Ok(runs.into_iter().next().unwrap());
-        }
+        let max_merge_ways = 16;
+        let sort_col_idx = schema.iter().position(|c| c.name == sort_col).unwrap_or(0);
 
-        // Collect all tuples from all runs, sort, write to single run
-        let sort_col = self.conditions.first()
-            .map(|c| c.left_col.clone())
-            .unwrap_or_default();
-
-        let mut all_tuples: Vec<Tuple> = Vec::new();
-        for run in &runs {
-            let file = OpenOptions::new().read(true).write(true).open(&run.file_path)?;
-            let mut scanner = TupleScanner::from_file(file, schema.to_vec())?;
-            all_tuples.extend(scanner.collect_all());
-        }
-
-        all_tuples.sort_by(|a, b| {
-            let va = a.get_field(&sort_col);
-            let vb = b.get_field(&sort_col);
-            match (va, vb) {
-                (Some(va), Some(vb)) => {
-                    va.partial_cmp_values(vb).unwrap_or(std::cmp::Ordering::Equal)
+        while runs.len() > 1 {
+            let mut next_runs = Vec::new();
+            for chunk in runs.chunks(max_merge_ways) {
+                if chunk.len() == 1 {
+                    next_runs.push(SortRun {
+                        file_path: chunk[0].file_path.clone(),
+                        page_count: chunk[0].page_count,
+                    });
+                    continue;
                 }
-                _ => std::cmp::Ordering::Equal,
+
+                let mut scanners = Vec::new();
+                for run in chunk {
+                    let file = OpenOptions::new().read(true).write(true).open(&run.file_path)?;
+                    scanners.push(TupleScanner::from_file(file, schema.to_vec())?);
+                }
+
+                let mut heap = BinaryHeap::new();
+                for (i, scanner) in scanners.iter_mut().enumerate() {
+                    if let Some(tuple) = scanner.next_tuple() {
+                        heap.push(MergeItem { tuple, run_idx: i, sort_col_idx });
+                    }
+                }
+
+                let merged_path = format!("database/tmp/merged_{}.tmp", uuid_simple());
+                let mut merged_file = OpenOptions::new()
+                    .create(true).write(true).read(true).truncate(true)
+                    .open(&merged_path)?;
+
+                let mut header = vec![0u8; PAGE_SIZE];
+                header[0..4].copy_from_slice(&1u32.to_le_bytes());
+                merged_file.write_all(&header)?;
+                merged_file.flush()?;
+                create_page(&mut merged_file)?;
+
+                while let Some(min_item) = heap.pop() {
+                    let bytes = self.serialize_tuple(&min_item.tuple, schema);
+                    insert_tuple(&mut merged_file, &bytes)?;
+
+                    if let Some(tuple) = scanners[min_item.run_idx].next_tuple() {
+                        heap.push(MergeItem { tuple, run_idx: min_item.run_idx, sort_col_idx });
+                    }
+                }
+
+                let pc = page_count(&mut merged_file)?;
+                next_runs.push(SortRun { file_path: merged_path, page_count: pc });
+
+                for run in chunk {
+                    let _ = fs::remove_file(&run.file_path);
+                }
             }
-        });
-
-        let merged_path = format!("database/tmp/merged_{}.tmp", uuid_simple());
-        let mut merged_file = OpenOptions::new()
-            .create(true).write(true).read(true).truncate(true)
-            .open(&merged_path)?;
-
-        let mut header = vec![0u8; PAGE_SIZE];
-        header[0..4].copy_from_slice(&1u32.to_le_bytes());
-        use std::io::Write;
-        merged_file.write_all(&header)?;
-        merged_file.flush()?;
-        create_page(&mut merged_file)?;
-
-        for t in &all_tuples {
-            let bytes = self.serialize_tuple(t, schema);
-            insert_tuple(&mut merged_file, &bytes)?;
+            runs = next_runs;
         }
 
-        let pc = page_count(&mut merged_file)?;
-        Ok(SortRun { file_path: merged_path, page_count: pc })
+        Ok(runs.into_iter().next().unwrap())
     }
 
     fn merge_join(
         &self,
+        _db: &str,
+        _catalog: &Catalog,
         left_run: &SortRun,
         right_run: &SortRun,
         left_schema: &[Column],
@@ -223,117 +250,147 @@ impl SMJExecutor {
 
         let mut result = JoinResult::new(left_schema, right_schema, &self.left_table, &self.right_table);
 
-        // Collect all sorted tuples for merge
-        let left_tuples = left_scanner.collect_all();
-        let right_tuples = right_scanner.collect_all();
+        let mut current_left = left_scanner.next_tuple();
+        let mut current_right = right_scanner.next_tuple();
+        let mut right_group: Vec<(Tuple, bool)> = Vec::new();
 
-        let mut li = 0usize;
-        let mut ri = 0usize;
+        while let Some(l) = &current_left {
+            let lv_opt = l.get_field(left_sort_col);
 
-        match self.join_type {
-            JoinType::Inner | JoinType::Cross => {
-                while li < left_tuples.len() && ri < right_tuples.len() {
-                    let lv = left_tuples[li].get_field(left_sort_col);
-                    let rv = right_tuples[ri].get_field(right_sort_col);
+            if lv_opt.is_none() {
+                if self.join_type == JoinType::LeftOuter || self.join_type == JoinType::FullOuter {
+                    let null_right = Tuple::null_tuple(right_schema);
+                    result.add(Tuple::merge(l, &null_right));
+                }
+                current_left = left_scanner.next_tuple();
+                continue;
+            }
+            let lv = lv_opt.unwrap();
 
-                    match (lv, rv) {
-                        (Some(lv), Some(rv)) => {
-                            match lv.partial_cmp_values(rv) {
-                                Some(std::cmp::Ordering::Less) => { li += 1; }
-                                Some(std::cmp::Ordering::Greater) => { ri += 1; }
-                                Some(std::cmp::Ordering::Equal) => {
-                                    // Collect all right tuples with same key
-                                    let mut right_group = Vec::new();
-                                    let key_val = rv.clone();
-                                    let mut rj = ri;
-                                    while rj < right_tuples.len() {
-                                        if let Some(rv2) = right_tuples[rj].get_field(right_sort_col) {
-                                            if rv2.eq_value(&key_val) {
-                                                right_group.push(&right_tuples[rj]);
-                                                rj += 1;
-                                            } else {
-                                                break;
-                                            }
-                                        } else {
-                                            break;
-                                        }
-                                    }
+            if !right_group.is_empty() && right_group[0].0.get_field(right_sort_col).unwrap().eq_value(lv) {
+                let mut matched_l = false;
+                for (r, r_matched) in &mut right_group {
+                    if evaluate_conditions(&self.conditions, l, r) {
+                        result.add(Tuple::merge(l, r));
+                        matched_l = true;
+                        *r_matched = true;
+                    }
+                }
+                if (self.join_type == JoinType::LeftOuter || self.join_type == JoinType::FullOuter) && !matched_l {
+                    let null_right = Tuple::null_tuple(right_schema);
+                    result.add(Tuple::merge(l, &null_right));
+                }
+                current_left = left_scanner.next_tuple();
+                continue;
+            } else if !right_group.is_empty() {
+                if self.join_type == JoinType::RightOuter || self.join_type == JoinType::FullOuter {
+                    for (r, r_matched) in &right_group {
+                        if !r_matched {
+                            let null_left = Tuple::null_tuple(left_schema);
+                            result.add(Tuple::merge(&null_left, r));
+                        }
+                    }
+                }
+                right_group.clear();
+            }
 
-                                    // Match all left tuples with same key against right group
-                                    while li < left_tuples.len() {
-                                        if let Some(lv2) = left_tuples[li].get_field(left_sort_col) {
-                                            if lv2.eq_value(&key_val) {
-                                                for r in &right_group {
-                                                    if evaluate_conditions(&self.conditions, &left_tuples[li], r) {
-                                                        result.add(Tuple::merge(&left_tuples[li], r));
-                                                    }
-                                                }
-                                                li += 1;
-                                            } else {
-                                                break;
-                                            }
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                    ri = rj;
+            let mut advanced_right = false;
+            while let Some(r) = &current_right {
+                let rv_opt = r.get_field(right_sort_col);
+                if rv_opt.is_none() {
+                    if self.join_type == JoinType::RightOuter || self.join_type == JoinType::FullOuter {
+                        let null_left = Tuple::null_tuple(left_schema);
+                        result.add(Tuple::merge(&null_left, r));
+                    }
+                    current_right = right_scanner.next_tuple();
+                    continue;
+                }
+                let rv = rv_opt.unwrap();
+
+                match lv.partial_cmp_values(rv) {
+                    Some(Ordering::Less) => { break; }
+                    Some(Ordering::Greater) => {
+                        if self.join_type == JoinType::RightOuter || self.join_type == JoinType::FullOuter {
+                            let null_left = Tuple::null_tuple(left_schema);
+                            result.add(Tuple::merge(&null_left, r));
+                        }
+                        current_right = right_scanner.next_tuple();
+                    }
+                    Some(Ordering::Equal) => {
+                        right_group.clear();
+                        let key_val = rv.clone();
+                        right_group.push((r.clone(), false));
+                        
+                        current_right = right_scanner.next_tuple();
+                        while let Some(next_r) = &current_right {
+                            if let Some(next_rv) = next_r.get_field(right_sort_col) {
+                                if next_rv.eq_value(&key_val) {
+                                    right_group.push((next_r.clone(), false));
+                                    current_right = right_scanner.next_tuple();
+                                } else {
+                                    break;
                                 }
-                                None => { li += 1; }
+                            } else {
+                                break;
                             }
                         }
-                        _ => { li += 1; }
+
+                        advanced_right = true;
+                        break;
+                    }
+                    None => {
+                        if self.join_type == JoinType::RightOuter || self.join_type == JoinType::FullOuter {
+                            let null_left = Tuple::null_tuple(left_schema);
+                            result.add(Tuple::merge(&null_left, r));
+                        }
+                        current_right = right_scanner.next_tuple();
                     }
                 }
             }
-            JoinType::LeftOuter => {
-                // For left outer, all left tuples must appear
-                let right_idx = 0usize;
-                for l in &left_tuples {
-                    let mut matched = false;
-                    // Find matching right tuples
-                    let mut rj = right_idx;
-                    while rj < right_tuples.len() {
-                        let lv = l.get_field(left_sort_col);
-                        let rv = right_tuples[rj].get_field(right_sort_col);
-                        match (lv, rv) {
-                            (Some(lv), Some(rv)) => {
-                                match lv.partial_cmp_values(rv) {
-                                    Some(std::cmp::Ordering::Greater) => { rj += 1; continue; }
-                                    Some(std::cmp::Ordering::Equal) => {
-                                        if evaluate_conditions(&self.conditions, l, &right_tuples[rj]) {
-                                            result.add(Tuple::merge(l, &right_tuples[rj]));
-                                            matched = true;
-                                        }
-                                        rj += 1;
-                                    }
-                                    _ => break,
-                                }
-                            }
-                            _ => break,
-                        }
+
+            if advanced_right {
+                let mut matched_l = false;
+                for (r, r_matched) in &mut right_group {
+                    if evaluate_conditions(&self.conditions, l, r) {
+                        result.add(Tuple::merge(l, r));
+                        matched_l = true;
+                        *r_matched = true;
                     }
-                    if !matched {
-                        let null_right = Tuple::null_tuple(right_schema);
-                        result.add(Tuple::merge(l, &null_right));
-                    }
+                }
+                if (self.join_type == JoinType::LeftOuter || self.join_type == JoinType::FullOuter) && !matched_l {
+                    let null_right = Tuple::null_tuple(right_schema);
+                    result.add(Tuple::merge(l, &null_right));
+                }
+            } else {
+                if self.join_type == JoinType::LeftOuter || self.join_type == JoinType::FullOuter {
+                    let null_right = Tuple::null_tuple(right_schema);
+                    result.add(Tuple::merge(l, &null_right));
                 }
             }
-            _ => {
-                // Fallback: use NLJ-style for other join types on sorted data
-                for l in &left_tuples {
-                    for r in &right_tuples {
-                        if evaluate_conditions(&self.conditions, l, r) {
-                            result.add(Tuple::merge(l, r));
-                        }
-                    }
+
+            current_left = left_scanner.next_tuple();
+        }
+
+        if !right_group.is_empty() && (self.join_type == JoinType::RightOuter || self.join_type == JoinType::FullOuter) {
+            for (r, r_matched) in &right_group {
+                if !r_matched {
+                    let null_left = Tuple::null_tuple(left_schema);
+                    result.add(Tuple::merge(&null_left, r));
                 }
+            }
+        }
+        
+        if self.join_type == JoinType::RightOuter || self.join_type == JoinType::FullOuter {
+            while let Some(r) = current_right {
+                let null_left = Tuple::null_tuple(left_schema);
+                result.add(Tuple::merge(&null_left, &r));
+                current_right = right_scanner.next_tuple();
             }
         }
 
         Ok(result)
     }
 
-    /// Serialize a Tuple back to raw bytes (INT=4 bytes LE, TEXT=10 bytes fixed).
     fn serialize_tuple(&self, tuple: &Tuple, schema: &[Column]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for (i, col) in schema.iter().enumerate() {
@@ -371,7 +428,9 @@ impl SMJExecutor {
         if let Ok(entries) = fs::read_dir(tmp_dir) {
             for entry in entries {
                 if let Ok(entry) = entry {
-                    let _ = fs::remove_file(entry.path());
+                    if entry.path().is_file() {
+                        let _ = fs::remove_file(entry.path());
+                    }
                 }
             }
         }
@@ -379,7 +438,6 @@ impl SMJExecutor {
     }
 }
 
-/// Simple pseudo-UUID for unique temp file names.
 fn uuid_simple() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()

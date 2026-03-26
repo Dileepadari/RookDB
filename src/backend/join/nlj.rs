@@ -1,4 +1,3 @@
-// Nested Loop Join executor (Simple + Block modes).
 use std::io;
 
 use crate::catalog::types::Catalog;
@@ -38,86 +37,84 @@ impl NLJExecutor {
 
         match self.join_type {
             JoinType::Cross => {
-                // Cross join: every combination, no condition check
-                let outer_tuples = outer_scanner.collect_all();
-                for o in &outer_tuples {
+                while let Some(o) = outer_scanner.next_tuple() {
                     inner_scanner.reset();
                     while let Some(i) = inner_scanner.next_tuple() {
-                        result.add(Tuple::merge(o, &i));
+                        result.add(Tuple::merge(&o, &i));
                     }
                 }
             }
             JoinType::Inner => {
-                let outer_tuples = outer_scanner.collect_all();
-                for o in &outer_tuples {
+                while let Some(o) = outer_scanner.next_tuple() {
                     inner_scanner.reset();
                     while let Some(i) = inner_scanner.next_tuple() {
-                        if evaluate_conditions(&self.conditions, o, &i) {
-                            result.add(Tuple::merge(o, &i));
+                        if evaluate_conditions(&self.conditions, &o, &i) {
+                            result.add(Tuple::merge(&o, &i));
                         }
                     }
                 }
             }
             JoinType::LeftOuter => {
-                let outer_tuples = outer_scanner.collect_all();
-                for o in &outer_tuples {
+                while let Some(o) = outer_scanner.next_tuple() {
                     inner_scanner.reset();
                     let mut matched = false;
                     while let Some(i) = inner_scanner.next_tuple() {
-                        if evaluate_conditions(&self.conditions, o, &i) {
-                            result.add(Tuple::merge(o, &i));
+                        if evaluate_conditions(&self.conditions, &o, &i) {
+                            result.add(Tuple::merge(&o, &i));
                             matched = true;
                         }
                     }
                     if !matched {
                         let null_right = Tuple::null_tuple(&right_schema);
-                        result.add(Tuple::merge(o, &null_right));
+                        result.add(Tuple::merge(&o, &null_right));
                     }
                 }
             }
             JoinType::RightOuter => {
-                // Gather all inner tuples, then for each inner check if any outer matches
-                let outer_tuples = outer_scanner.collect_all();
-                let inner_tuples = inner_scanner.collect_all();
-                for i in &inner_tuples {
+                while let Some(i) = inner_scanner.next_tuple() {
+                    outer_scanner.reset();
                     let mut matched = false;
-                    for o in &outer_tuples {
-                        if evaluate_conditions(&self.conditions, o, i) {
-                            result.add(Tuple::merge(o, i));
+                    while let Some(o) = outer_scanner.next_tuple() {
+                        if evaluate_conditions(&self.conditions, &o, &i) {
+                            result.add(Tuple::merge(&o, &i));
                             matched = true;
                         }
                     }
                     if !matched {
                         let null_left = Tuple::null_tuple(&left_schema);
-                        result.add(Tuple::merge(&null_left, i));
+                        result.add(Tuple::merge(&null_left, &i));
                     }
                 }
             }
             JoinType::FullOuter => {
-                let outer_tuples = outer_scanner.collect_all();
-                let inner_tuples = inner_scanner.collect_all();
-                let mut right_matched = vec![false; inner_tuples.len()];
+                let mut right_matched = std::collections::HashSet::new();
 
-                for o in &outer_tuples {
+                while let Some(o) = outer_scanner.next_tuple() {
+                    inner_scanner.reset();
                     let mut left_matched = false;
-                    for (j, i) in inner_tuples.iter().enumerate() {
-                        if evaluate_conditions(&self.conditions, o, i) {
-                            result.add(Tuple::merge(o, i));
+                    let mut j = 0;
+                    while let Some(i) = inner_scanner.next_tuple() {
+                        if evaluate_conditions(&self.conditions, &o, &i) {
+                            result.add(Tuple::merge(&o, &i));
                             left_matched = true;
-                            right_matched[j] = true;
+                            right_matched.insert(j);
                         }
+                        j += 1;
                     }
                     if !left_matched {
                         let null_right = Tuple::null_tuple(&right_schema);
-                        result.add(Tuple::merge(o, &null_right));
+                        result.add(Tuple::merge(&o, &null_right));
                     }
                 }
-                // Emit unmatched right tuples
-                for (j, i) in inner_tuples.iter().enumerate() {
-                    if !right_matched[j] {
+                
+                inner_scanner.reset();
+                let mut j = 0;
+                while let Some(i) = inner_scanner.next_tuple() {
+                    if !right_matched.contains(&j) {
                         let null_left = Tuple::null_tuple(&left_schema);
-                        result.add(Tuple::merge(&null_left, i));
+                        result.add(Tuple::merge(&null_left, &i));
                     }
+                    j += 1;
                 }
             }
         }
@@ -134,23 +131,64 @@ impl NLJExecutor {
 
         let mut result = JoinResult::new(&left_schema, &right_schema, &self.outer_table, &self.inner_table);
 
-        // Collect outer tuples in blocks
-        let all_outer = outer_scanner.collect_all();
         let block_size_tuples = self.block_size * 100; // approximate tuples per block
 
-        for chunk in all_outer.chunks(block_size_tuples.max(1)) {
-            inner_scanner.reset();
-            while let Some(i) = inner_scanner.next_tuple() {
-                for o in chunk {
-                    match self.join_type {
-                        JoinType::Cross => {
-                            result.add(Tuple::merge(o, &i));
+        // We handle Inner, Cross, and LeftOuter fully. RightOuter/FullOuter will use inner buffering.
+        match self.join_type {
+            JoinType::Inner | JoinType::Cross | JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter => {
+                let mut right_matched = std::collections::HashSet::new();
+
+                loop {
+                    let mut chunk = Vec::new();
+                    for _ in 0..block_size_tuples {
+                        if let Some(t) = outer_scanner.next_tuple() {
+                            chunk.push(t);
+                        } else {
+                            break;
                         }
-                        _ => {
-                            if evaluate_conditions(&self.conditions, o, &i) {
+                    }
+                    if chunk.is_empty() {
+                        break;
+                    }
+
+                    inner_scanner.reset();
+                    let mut outer_matched = vec![false; chunk.len()];
+                    let mut inner_idx = 0;
+
+                    while let Some(i) = inner_scanner.next_tuple() {
+                        for (idx, o) in chunk.iter().enumerate() {
+                            if self.join_type == JoinType::Cross {
                                 result.add(Tuple::merge(o, &i));
+                                outer_matched[idx] = true;
+                                right_matched.insert(inner_idx);
+                            } else if evaluate_conditions(&self.conditions, o, &i) {
+                                result.add(Tuple::merge(o, &i));
+                                outer_matched[idx] = true;
+                                right_matched.insert(inner_idx);
                             }
                         }
+                        inner_idx += 1;
+                    }
+
+                    if self.join_type == JoinType::LeftOuter || self.join_type == JoinType::FullOuter {
+                        for (idx, o) in chunk.iter().enumerate() {
+                            if !outer_matched[idx] {
+                                let null_right = Tuple::null_tuple(&right_schema);
+                                result.add(Tuple::merge(o, &null_right));
+                            }
+                        }
+                    }
+                }
+
+                if self.join_type == JoinType::RightOuter || self.join_type == JoinType::FullOuter {
+                    inner_scanner.reset();
+                    let mut inner_idx = 0;
+                    while let Some(i) = inner_scanner.next_tuple() {
+                        if !right_matched.contains(&inner_idx) {
+                            let null_left = Tuple::null_tuple(&left_schema);
+                            result.add(Tuple::merge(&null_left, &i));
+                        }
+                        inner_idx += 1;
                     }
                 }
             }
