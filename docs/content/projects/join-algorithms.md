@@ -112,3 +112,4 @@ Advanced joins (SMJ, HJ) write temporary data to disk.
 
 ### Benchmarking and Testing
 - **Tests:** The integration test suite is grouped into a single, high-performance integration crate at `tests/test_joins.rs`, which runs submodules located in `tests/join/` (e.g., `test_nlj.rs`, `test_smj.rs`, `test_hj.rs`, `test_shj.rs`, `test_direct.rs`). Because Cargo runs integration crates in parallel, this unified structure utilizes a shared global lock (`tests/join/common.rs`) to safely manage the global `catalog.json` state. Always run `cargo test --test test_joins` when making modifications.
+- **Performance:** When tweaking the inner loops of the join engine or the Cost Model, run `cargo bench` to execute the macro-benchmark suite in `benches/bench_joins.rs` to verify that execution time remains stable at scale (N=10,000+). All supported algorithms are benchmarked across all logical join types.

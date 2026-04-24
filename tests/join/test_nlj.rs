@@ -2,7 +2,6 @@
 //! Creates a fresh test database, inserts known data, and verifies join results.
 
 use std::fs::{self, OpenOptions};
-use std::sync::{Mutex, OnceLock};
 
 use storage_manager::catalog::types::Column;
 use storage_manager::catalog::{create_database, create_table, init_catalog, load_catalog, save_catalog};

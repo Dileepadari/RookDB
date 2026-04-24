@@ -2,7 +2,6 @@
 // Cross-checks results against NLJ for correctness parity.
 
 use std::fs::{self, OpenOptions};
-use std::sync::{Mutex, OnceLock};
 
 use storage_manager::catalog::types::Column;
 use storage_manager::catalog::{create_database, create_table, save_catalog, load_catalog, init_catalog};
